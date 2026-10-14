@@ -8,13 +8,16 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node tests/piiEngine.test.mjs",
+    "test": "node tests/piiEngine.test.mjs && node tests/parsers.test.mjs && node tests/pdfCoords.test.mjs",
     "lint": "eslint . --ext .js,.jsx,.mjs"
   },
   "dependencies": {
+    "fflate": "^0.8.3",
     "lucide-react": "^0.454.0",
+    "pdfjs-dist": "^4.10.38",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "tesseract.js": "^5.1.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
@@ -22,6 +25,7 @@
     "@vitejs/plugin-react": "^4.3.3",
     "autoprefixer": "^10.4.20",
     "eslint": "^8.57.1",
+    "eslint-plugin-react": "^7.37.1",
     "eslint-plugin-react-hooks": "^4.6.2",
     "eslint-plugin-react-refresh": "^0.4.14",
     "postcss": "^8.4.49",

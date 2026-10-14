@@ -37,12 +37,15 @@ import {
   X,
   Printer,
   ScanText,
+  AlertTriangle,
 } from 'lucide-react'
 import {
   detectPii,
   buildSegments,
   segmentsToPlainText,
 } from './lib/piiEngine.js'
+import { parseFile, attachOcr } from './lib/parsers/index.js'
+import PdfRedactionCanvas from './components/PdfRedactionCanvas.jsx'
 
 /* ------------------------------------------------------------------ *
  * 1. 법정 개인정보 프리셋
@@ -162,24 +165,34 @@ const INITIAL_CUSTOM_RULES = [
  * 2. 문서 유틸리티
  * ------------------------------------------------------------------ */
 
-const CHARS_PER_PAGE = 1200
-
-function chunkToPages(text) {
-  const pages = []
-  for (let i = 0; i < text.length || pages.length === 0; i += CHARS_PER_PAGE) {
-    pages.push(text.slice(i, i + CHARS_PER_PAGE))
-  }
-  return pages.map((t, idx) => ({
-    pageNumber: idx + 1,
-    title: `페이지 ${idx + 1} / ${pages.length}`,
-    rawText: t,
+/** 파서 결과(parsers/index.js)를 앱 내부 문서 모델로 변환 */
+function buildDocument({ id, name, ext, sizeLabel, uploadedAt, source, parsed, fileRef }) {
+  const pages = (parsed.pages ?? []).map((p) => ({
+    pageNumber: p.pageNumber,
+    title: p.title,
+    rawText: p.text,
     items: [],
+    runs: p.runs, // PDF 좌표 레이어 (텍스트 문서에는 없음)
+    width: p.width,
+    height: p.height,
   }))
-}
 
-function buildDocument({ id, name, ext, sizeLabel, uploadedAt, text, source }) {
-  const pages = chunkToPages(text)
-  return { id, name, type: ext, size: sizeLabel, pages: pages.length, uploadedAt, source, pagesData: pages }
+  return {
+    id,
+    name,
+    type: ext,
+    kind: parsed.kind,
+    size: sizeLabel,
+    pages: pages.length,
+    uploadedAt,
+    source,
+    warnings: parsed.warnings ?? [],
+    needsOcr: !!parsed.needsOcr,
+    ocr: parsed.ocr ?? null,
+    numPages: parsed.numPages ?? pages.length,
+    fileRef, // 원본 File (OCR 재실행용)
+    pagesData: pages,
+  }
 }
 
 function formatBytes(bytes) {
@@ -188,18 +201,6 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-const TEXT_LIKE = /\.(txt|csv|tsv|md|json|log|xml|html|htm)$/i
-
-async function extractTextFromFile(file) {
-  if (TEXT_LIKE.test(file.name)) return file.text()
-  const buffer = await file.arrayBuffer()
-  return new TextDecoder('utf-8', { fatal: false }).decode(buffer)
-}
-
-function extOf(name) {
-  const m = name.toLowerCase().match(/\.([a-z0-9]+)$/)
-  return m ? m[1].toUpperCase() : 'FILE'
-}
 
 function nowStamp() {
   const d = new Date()
@@ -282,6 +283,33 @@ const SAMPLE_TEXT_DOC3 = `[자동차운전면허증 / OCR 스캔 이미지 분�
 유효기간: 2019.03.14 ~ 2029.03.14
 혈액형: AB형 (민감정보 - 법 제23조 대상)`
 
+/** 샘플 문서용 가짜 파서 결과 (테스트/데모용 — 실제 업로드는 parseFile 사용) */
+function makeSampleParsed(text, extra = {}) {
+  const CHARS = 3000
+  const lines = text.split('\n')
+  const chunks = []
+  let buf = []
+  let len = 0
+  for (const line of lines) {
+    buf.push(line)
+    len += line.length + 1
+    if (len >= CHARS) {
+      chunks.push(buf.join('\n'))
+      buf = []
+      len = 0
+    }
+  }
+  if (buf.length) chunks.push(buf.join('\n'))
+
+  const pages = (chunks.length ? chunks : ['']).map((t, i) => ({
+    pageNumber: i + 1,
+    title: `페이지 ${i + 1} / ${chunks.length || 1}`,
+    text: t,
+  }))
+
+  return { kind: 'text', warnings: [], needsOcr: false, pages, ...extra }
+}
+
 const SAMPLE_DOCUMENTS = [
   buildDocument({
     id: 'doc1',
@@ -289,8 +317,8 @@ const SAMPLE_DOCUMENTS = [
     ext: 'PDF',
     sizeLabel: '2.4 MB',
     uploadedAt: '2026-10-14 16:30',
-    text: SAMPLE_TEXT_DOC1,
     source: 'sample',
+    parsed: makeSampleParsed(SAMPLE_TEXT_DOC1, { kind: 'pdf' }),
   }),
   buildDocument({
     id: 'doc2',
@@ -298,8 +326,8 @@ const SAMPLE_DOCUMENTS = [
     ext: 'XLSX',
     sizeLabel: '1.8 MB',
     uploadedAt: '2026-10-14 16:32',
-    text: SAMPLE_TEXT_DOC2,
     source: 'sample',
+    parsed: makeSampleParsed(SAMPLE_TEXT_DOC2, { kind: 'xlsx' }),
   }),
   buildDocument({
     id: 'doc3',
@@ -307,8 +335,8 @@ const SAMPLE_DOCUMENTS = [
     ext: 'PNG',
     sizeLabel: '3.1 MB',
     uploadedAt: '2026-10-14 16:35',
-    text: SAMPLE_TEXT_DOC3,
     source: 'sample',
+    parsed: makeSampleParsed(SAMPLE_TEXT_DOC3, { kind: 'text' }),
   }),
 ]
 
@@ -337,6 +365,9 @@ export default function App() {
   const [zoomLevel, setZoomLevel] = useState(100)
   const [isDragging, setIsDragging] = useState(false)
   const fileInputRef = useRef(null)
+  const [isParsing, setIsParsing] = useState(false)
+  const [parseProgress, setParseProgress] = useState(null) // { stage, progress, detail }
+  const [ocrDocId, setOcrDocId] = useState(null)
 
   // 처리 상태
   const [isProcessing, setIsProcessing] = useState(false)
@@ -506,37 +537,121 @@ export default function App() {
       const files = Array.from(fileList ?? [])
       if (files.length === 0) return
 
+      setIsParsing(true)
+      setParseProgress({ stage: '파일 준비 중', progress: 0, detail: `${files.length}개` })
+
       const created = []
-      for (const file of files) {
-        let text = ''
+      const failures = []
+
+      for (const [i, file] of files.entries()) {
         try {
-          text = await extractTextFromFile(file)
-        } catch {
-          text = ''
+          const parsed = await parseFile(file, {
+            onProgress: (p) =>
+              setParseProgress({
+                stage: p.stage ?? '파싱 중',
+                progress: (i + (p.progress ?? 0)) / files.length,
+                detail: file.name,
+              }),
+          })
+
+          created.push(
+            buildDocument({
+              id: `up_${Date.now()}_${i}_${file.name}`,
+              name: file.name,
+              ext: parsed.ext,
+              sizeLabel: formatBytes(file.size),
+              uploadedAt: nowStamp(),
+              source: 'upload',
+              parsed,
+              fileRef: file,
+            }),
+          )
+        } catch (err) {
+          failures.push(`${file.name}: ${err.message}`)
         }
-        if (!text.trim()) {
-          text = `[${file.name}]\n(바이너리 포맷으로 텍스트 레이어를 추출하지 못했습니다. 샘플 문서를 이용해 기능을 체험해 보세요.)`
-        }
-        created.push(
-          buildDocument({
-            id: `up_${Date.now()}_${file.name}`,
-            name: file.name,
-            ext: extOf(file.name),
-            sizeLabel: formatBytes(file.size),
-            uploadedAt: nowStamp(),
-            text,
-            source: 'upload',
-          }),
-        )
       }
 
-      if (created.length === 0) return
-      setUploadedFiles((prev) => [...created, ...prev])
-      setSelectedDocId(created[0].id)
-      setSelectedPageNum(1)
-      showToast(`${created.length}개 파일이 업로드 대기열에 추가되었습니다.`)
+      setIsParsing(false)
+      setParseProgress(null)
+
+      if (created.length > 0) {
+        setUploadedFiles((prev) => [...created.map(runDetection), ...prev])
+        setSelectedDocId(created[0].id)
+        setSelectedPageNum(1)
+      }
+
+      const detected = created.reduce(
+        (s, d) => s + d.pagesData.reduce((x, p) => x + p.items.length, 0),
+        0,
+      )
+      if (created.length) {
+        showToast(
+          `${created.length}개 파일 파싱 완료 · 개인정보 ${detected}건 탐지${created[0].needsOcr ? ' (OCR 필요)' : ''}`,
+        )
+      }
+      if (failures.length) {
+        showToast(`일부 파일 파싱 실패 — ${failures[0]}`)
+      }
     },
-    [showToast],
+    [runDetection, showToast],
+  )
+
+  /** 이미지/스캔 PDF 에 대해 OCR 실행 (tesseract.js 지연 로드) */
+  const handleRunOcr = useCallback(
+    async (docId) => {
+      const doc = uploadedFiles.find((f) => f.id === docId)
+      if (!doc?.fileRef) {
+        showToast('원본 파일을 찾을 수 없어 OCR을 실행할 수 없습니다. 다시 업로드해주세요.')
+        return
+      }
+
+      setOcrDocId(docId)
+      setParseProgress({ stage: 'OCR 준비 중', progress: 0, detail: doc.name })
+
+      try {
+        const parsed = await attachOcr(
+          {
+            warnings: doc.warnings,
+            needsOcr: doc.needsOcr,
+            ext: doc.type,
+            mime: doc.fileRef.type,
+            name: doc.name,
+            pages: [],
+            text: '',
+          },
+          doc.fileRef,
+          { onProgress: (p) => setParseProgress({ stage: p.stage, progress: p.progress ?? 0, detail: doc.name }) },
+        )
+
+        setUploadedFiles((prev) =>
+          prev.map((f) =>
+            f.id === docId
+              ? runDetection(
+                  buildDocument({
+                    id: f.id,
+                    name: f.name,
+                    ext: f.type,
+                    sizeLabel: f.size,
+                    uploadedAt: f.uploadedAt,
+                    source: f.source,
+                    fileRef: f.fileRef,
+                    parsed: { ...parsed, kind: f.kind === 'image' ? 'text' : f.kind },
+                  }),
+                )
+              : f,
+          ),
+        )
+        setSelectedDocId(docId)
+        setSelectedPageNum(1)
+        showToast(`OCR 완료 · 신뢰도 ${Math.round(parsed.ocr?.confidence ?? 0)}%`)
+      } catch (err) {
+        showToast(`OCR 실패: ${err.message}`)
+      } finally {
+        setOcrDocId(null)
+        setParseProgress(null)
+      }
+    },
+    [uploadedFiles, runDetection, showToast],
   )
 
   const handleRemoveDoc = (docId) => {
@@ -563,6 +678,7 @@ export default function App() {
   /* --------------------------- Downloads ------------------------- */
 
   const allItems = currentDoc?.pagesData.flatMap((p) => p.items) ?? []
+  const isPdfCanvas = currentDoc?.kind === 'pdf' && !!currentDoc?.fileRef
   const segments = currentPageData
     ? buildSegments(currentPageData, currentPageData.items, maskingStyle, customReplaceText)
     : []
@@ -1116,6 +1232,30 @@ export default function App() {
               </div>
             </div>
 
+            {/* 파싱 진행 표시 */}
+            {isParsing && parseProgress && (
+              <div className="rounded-2xl border border-indigo-200 bg-indigo-50 p-5 shadow-sm">
+                <div className="mb-3 flex items-center justify-between gap-3 text-xs">
+                  <span className="flex items-center gap-2 font-semibold text-indigo-800">
+                    <ScanText className="h-4 w-4 animate-pulse" />
+                    {parseProgress.stage}
+                  </span>
+                  <span className="max-w-[50%] truncate text-indigo-600">
+                    {parseProgress.detail}
+                  </span>
+                </div>
+                <div className="h-2.5 w-full overflow-hidden rounded-full border border-indigo-200 bg-white">
+                  <div
+                    className="h-full bg-indigo-600 transition-all duration-200"
+                    style={{ width: `${Math.round((parseProgress.progress ?? 0) * 100)}%` }}
+                  />
+                </div>
+                <div className="mt-1.5 text-right font-mono text-[10px] text-indigo-500">
+                  {Math.round((parseProgress.progress ?? 0) * 100)}%
+                </div>
+              </div>
+            )}
+
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <h4 className="flex items-center space-x-2 text-sm font-bold text-slate-900">
@@ -1209,20 +1349,49 @@ export default function App() {
                             <span>•</span>
                             <span>{f.size}</span>
                             <span>•</span>
+                            <span>
+                              {f.pages}페이지
+                              {f.numPages && f.numPages !== f.pages
+                                ? ` (원본 ${f.numPages})`
+                                : ''}
+                            </span>
+                            <span>•</span>
                             <span>{f.uploadedAt}</span>
                           </div>
+                          {f.warnings?.length > 0 && (
+                            <div className="mt-1 flex items-start gap-1 text-[10px] leading-relaxed text-amber-700">
+                              <AlertTriangle className="mt-px h-3 w-3 flex-shrink-0" />
+                              <span>{f.warnings[0]}</span>
+                            </div>
+                          )}
                         </div>
                       </button>
 
                       <div className="flex flex-shrink-0 items-center gap-2">
+                        {f.needsOcr && (
+                          <button
+                            onClick={() => handleRunOcr(f.id)}
+                            disabled={ocrDocId === f.id}
+                            className="flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-100 px-2.5 py-1 text-[10px] font-bold text-amber-800 transition-colors hover:bg-amber-200 disabled:opacity-50"
+                          >
+                            <ScanText className="h-3 w-3" />
+                            {ocrDocId === f.id ? 'OCR 중...' : 'OCR 실행'}
+                          </button>
+                        )}
                         <span
                           className={`rounded-lg border px-3 py-1 text-xs font-medium ${
-                            count > 0
-                              ? 'border-indigo-200 bg-indigo-100 text-indigo-800'
-                              : 'border-emerald-200 bg-emerald-100 text-emerald-800'
+                            f.needsOcr
+                              ? 'border-amber-300 bg-amber-50 text-amber-800'
+                              : count > 0
+                                ? 'border-indigo-200 bg-indigo-100 text-indigo-800'
+                                : 'border-slate-200 bg-slate-100 text-slate-600'
                           }`}
                         >
-                          {count > 0 ? `민감정보 ${count}건 탐지` : '탐지 대기'}
+                          {f.needsOcr
+                            ? 'OCR 필요'
+                            : count > 0
+                              ? `민감정보 ${count}건 탐지`
+                              : '민감정보 없음'}
                         </span>
                         <button
                           onClick={() => handleRemoveDoc(f.id)}
@@ -1522,59 +1691,80 @@ export default function App() {
                 </div>
 
                 {currentPageData ? (
-                  <>
+                  isPdfCanvas ? (
+                    <PdfRedactionCanvas
+                      file={currentDoc.fileRef}
+                      pageNumber={currentPageData.pageNumber}
+                      runs={currentPageData.runs}
+                      width={currentPageData.width}
+                      height={currentPageData.height}
+                      items={currentPageData.items}
+                      rawText={currentPageData.rawText}
+                      maskStyle={maskingStyle}
+                      customText={customReplaceText}
+                      onToggle={(itemId) =>
+                        handleTogglePiiItemMask(currentDoc.id, currentPageData.pageNumber, itemId)
+                      }
+                      needsOcr={currentDoc.needsOcr}
+                      onRunOcr={() => handleRunOcr(currentDoc.id)}
+                      ocrRunning={ocrDocId === currentDoc.id}
+                    />
+                  ) : (
                     <div className="whitespace-pre-wrap leading-relaxed">
                       {segments.map(renderSegment)}
                     </div>
-
-                    <div className="mt-8 border-t border-slate-200 pt-4">
-                      <div className="mb-2 text-xs font-bold text-slate-600">
-                        이 페이지에서 감지된 개인정보 항목 (클릭하여 개별 해제/설정):
-                      </div>
-                      {currentPageData.items.length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center text-xs text-slate-400">
-                          이 페이지에서는 활성화된 규칙에 해당하는 개인정보가 탐지되지 않았습니다.
-                        </div>
-                      ) : (
-                        <div className="flex flex-wrap gap-2">
-                          {currentPageData.items.map((item) => (
-                            <button
-                              key={item.id}
-                              onClick={() =>
-                                handleTogglePiiItemMask(
-                                  currentDoc.id,
-                                  currentPageData.pageNumber,
-                                  item.id,
-                                )
-                              }
-                              className={`flex items-center space-x-2 rounded-xl border px-3 py-1.5 text-xs transition-all ${
-                                item.masked
-                                  ? 'border-rose-200 bg-rose-50 text-rose-800 shadow-xs hover:bg-rose-100'
-                                  : 'border-slate-200 bg-slate-100 text-slate-400 line-through hover:text-slate-600'
-                              }`}
-                            >
-                              <Shield className="h-3.5 w-3.5 flex-shrink-0 text-rose-600" />
-                              <span className="font-semibold">{item.typeLabel}</span>
-                              <span className="font-mono">{item.value}</span>
-                              <span
-                                className={`rounded border px-1.5 text-[9px] font-bold ${
-                                  SEVERITY_BADGE[item.severity]
-                                }`}
-                              >
-                                {item.severity}
-                              </span>
-                              <span className="font-mono text-[10px] opacity-60">
-                                ({item.confidence})
-                              </span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </>
+                  )
                 ) : (
                   <div className="py-16 text-center text-xs text-slate-400">
                     검토할 문서가 없습니다.
+                  </div>
+                )}
+
+                {/* 텍스트/PDF 공통: 탐지 항목 칩 */}
+                {currentPageData && currentPageData.items.length > 0 && (
+                  <div className="mt-8 border-t border-slate-200 pt-4">
+                    <div className="mb-2 text-xs font-bold text-slate-600">
+                      이 페이지에서 감지된 개인정보 항목 (클릭하여 개별 해제/설정):
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {currentPageData.items.map((item) => (
+                        <button
+                          key={item.id}
+                          onClick={() =>
+                            handleTogglePiiItemMask(
+                              currentDoc.id,
+                              currentPageData.pageNumber,
+                              item.id,
+                            )
+                          }
+                          className={`flex items-center gap-2 rounded-xl border px-3 py-1.5 text-xs transition-all ${
+                            item.masked
+                              ? 'border-rose-200 bg-rose-50 text-rose-800 shadow-xs hover:bg-rose-100'
+                              : 'border-slate-200 bg-slate-100 text-slate-400 line-through hover:text-slate-600'
+                          }`}
+                        >
+                          <Shield className="h-3.5 w-3.5 flex-shrink-0 text-rose-600" />
+                          <span className="font-semibold">{item.typeLabel}</span>
+                          <span className="font-mono">{item.value}</span>
+                          <span
+                            className={`rounded border px-1.5 text-[9px] font-bold ${
+                              SEVERITY_BADGE[item.severity]
+                            }`}
+                          >
+                            {item.severity}
+                          </span>
+                          <span className="font-mono text-[10px] opacity-60">
+                            ({item.confidence})
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {currentPageData && !currentPageData.items.length && (
+                  <div className="mt-8 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center text-xs text-slate-400">
+                    이 페이지에서는 활성화된 규칙에 해당하는 개인정보가 탐지되지 않았습니다.
                   </div>
                 )}
               </div>
